@@ -1,0 +1,47 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE config SYSTEM "http://www.matsim.org/files/dtd/config_v2.dtd">
+<config>
+
+  <!-- Network -->
+  <module name="network">
+    <param name="inputNetworkFile" value="C:/EvMatsim/wasfrontscenario/wasfront_cleaned.xml"/>
+  </module>
+
+  <!-- Plans -->
+  <module name="plans">
+    <param name="inputPlansFile" value="C:/EvMatsim/wasfrontscenario/plans_output.xml"/>
+  </module>
+
+  <!-- Vehicles -->
+  <module name="vehicles">
+    <param name="vehiclesFile" value="C:/EvMatsim/wasfrontscenario/vehicles_output.xml"/>
+  </module>
+
+  <!-- EV / Chargers -->
+  <module name="ev">
+    <param name="chargersFile" value="C:/EvMatsim/wasfrontscenario/chargers.xml"/>
+  </module>
+
+  <!-- Counts (dummy is OK, just needed by the loader) -->
+  <module name="counts">
+    <param name="inputCountsFile" value="C:/EvMatsim/wasfrontscenario/counts.xml"/>
+    <param name="writeCountsInterval" value="0"/>
+    <param name="averageCountsOverIterations" value="1"/>
+    <param name="countsScaleFactor" value="1"/>
+  </module>
+
+  <!-- Controller -->
+  <module name="controler">
+    <param name="outputDirectory" value="C:/EvMatsim/wasfrontscenario/output/"/>
+    <param name="lastIteration" value="0"/>
+    <param name="overwriteFiles" value="deleteDirectoryIfExists"/>
+  </module>
+
+  <!-- QSim -->
+  <module name="qsim">
+    <param name="startTime" value="00:00:00"/>
+    <param name="endTime" value="30:00:00"/>
+    <param name="numberOfThreads" value="1"/>
+  </module>
+
+</config>

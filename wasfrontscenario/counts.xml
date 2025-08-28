@@ -1,0 +1,5 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE counts SYSTEM "http://www.matsim.org/files/dtd/counts_v1.dtd">
+<counts name="dummyCounts" desc="placeholder" year="2025">
+  <!-- empty on purpose -->
+</counts>

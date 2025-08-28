@@ -15,6 +15,7 @@ from rlev.classes.chargers import Charger, StaticCharger, NoneCharger, DynamicCh
 from typing import List
 from filelock import FileLock
 from rlev.scripts.create_chargers import create_chargers_xml_gymnasium
+from uuid import uuid4
 
 class MatsimGraphEnv(gym.Env):
     """
@@ -33,7 +34,7 @@ class MatsimGraphEnv(gym.Env):
         super().__init__()
         self.save_dir = save_dir
         current_time = datetime.now()
-        self.time_string = current_time.strftime("%Y%m%d_%H%M%S_%f")
+        self.time_string = current_time.strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid4().hex[:8]
         if num_agents < 0:
             num_agents = None
         self.num_agents = num_agents
@@ -109,12 +110,10 @@ class MatsimGraphEnv(gym.Env):
             print(f"Extracted files to: {extract_folder}")
 
     def send_reward_request(self, actions):
-        """
-        Send a reward request to the server and process the response.
-
-        Returns:
-            tuple: Reward value and server response.
-        """
+    # ---- add these two lines right at the start of the function ----
+        response = None
+        reward = -float("inf")
+    # ----------------------------------------------------------------
 
         create_chargers_xml_gymnasium(
             self.dataset.charger_xml_path,
@@ -122,7 +121,7 @@ class MatsimGraphEnv(gym.Env):
             actions,
             self.dataset.edge_mapping,
         )
-        
+
         url = "http://localhost:8000/getReward"
         files = {
             "config": open(self.dataset.config_path, "rb"),
@@ -133,9 +132,7 @@ class MatsimGraphEnv(gym.Env):
             "counts": open(self.dataset.counts_xml_path, "rb"),
             "consumption_map": open(self.dataset.consumption_map_path, "rb"),
         }
-        response = requests.post(
-            url, params={"folder_name": self.time_string}, files=files
-        )
+        response = requests.post(url, params={"folder_name": self.time_string}, files=files)
         json_response = json.loads(response.headers["X-response-message"])
         charge_reward = float(json_response["charge_reward"])
         time_reward = float(json_response["time_reward"])
@@ -144,23 +141,27 @@ class MatsimGraphEnv(gym.Env):
         self._time_efficiency = time_reward
 
         filetype = json_response["filetype"]
-
         if filetype == "initialoutput":
             self.save_server_output(response, filetype)
 
-        charger_cost = self.dataset.parse_charger_network_get_charger_cost().item()
+    # robust float conversion: handles int or tensor-like
+        charger_cost_raw = self.dataset.parse_charger_network_get_charger_cost()
+        try:
+            charger_cost = float(charger_cost_raw)
+        except Exception:
+            charger_cost = float(charger_cost_raw.item())
         self._charger_cost = charger_cost
 
-        charger_cost_reward = charger_cost / self.dataset.max_charger_cost
-        reward = (charge_reward - time_reward - charger_cost_reward)
+        charger_cost_reward = charger_cost / float(self.dataset.max_charger_cost)
+        reward = charge_reward - time_reward - charger_cost_reward
 
         if reward > self.best_reward:
             self.best_reward = reward
             self.best_output_response = response
 
         self._reward = reward
-        
         return reward
+
 
     @abstractmethod
     def reset(self, **kwargs):
@@ -200,7 +201,7 @@ class MatsimGraphEnv(gym.Env):
             {
                 "iteration": [0],
                 "reward": [self.reward],
-                "cost": [self.dataset.charger_cost.item()],
+                "cost": [float(self.dataset.charger_cost)],
                 "static_chargers": [static_chargers],
                 "dynamic_chargers": [dynamic_chargers],
             }
