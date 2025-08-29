@@ -4,18 +4,17 @@ import com.google.common.util.concurrent.AtomicDouble;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVRecord;
 import org.apache.commons.io.FileUtils;
 import org.jfree.data.json.impl.JSONObject;
 import org.matsim.core.config.Config;
 import org.matsim.core.config.ConfigReader;
 import org.matsim.core.config.ConfigUtils;
 import org.matsim.core.controler.Controler;
-import org.w3c.dom.*;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.*;
+
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URL;
@@ -25,10 +24,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
 
 public class OCPRewardServer {
 
@@ -38,6 +33,9 @@ public class OCPRewardServer {
 
     private final AtomicDouble bestReward = new AtomicDouble(Double.NEGATIVE_INFINITY);
     private final AtomicBoolean initialResponse = new AtomicBoolean(true);
+
+    // Cache parsed vehicle energy capacity per vehicles.xml path (kept for future use)
+    private final ConcurrentHashMap<Path, Double> capacityCache = new ConcurrentHashMap<>();
 
     public OCPRewardServer(int threadPoolSize){
         this.threadPoolSize = threadPoolSize;
@@ -92,18 +90,42 @@ public class OCPRewardServer {
 
                 File logFile = new File(configPath.getParent().toString(), "log.txt");
 
-                // Load config and discover vehicles file name (may be null)
-                Config config = new Config();
-                new ConfigReader(config).parse(configPath.toUri().toURL());
-                String vehiclesFileName = config.getParam("vehicles", "vehiclesFile");
+                // Load config (for reference; we still override output dir earlier)
+                Config cfgHeader = new Config();
+                new ConfigReader(cfgHeader).parse(configPath.toUri().toURL());
 
-                // Run MATSim in-process
                 int exitCode = 0;
+
+                // >>> FIX: declare probe OUTSIDE try so we can read from it afterwards.
+                RewardProbe probe = new RewardProbe();
+
                 try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
                     log.println("=== Starting MATSim Controler.run() ===");
                     log.flush();
+
                     Config runCfg = ConfigUtils.loadConfig(configPath.toString());
+
+                    // --- SPEEDUPS: keep I/O & work minimal for server-side runs ---
+                    runCfg.controller().setLastIteration(0);
+                    runCfg.controller().setWriteEventsInterval(0);
+                    runCfg.controller().setWritePlansInterval(0);
+                    runCfg.controller().setCreateGraphs(false);
+                    runCfg.controller().setDumpDataAtEnd(false);
+                    // Deterministic + lighter on Windows:
+                    runCfg.qsim().setNumberOfThreads(1);
+                    runCfg.global().setNumberOfThreads(1);
+                    // Optional horizon cap:
+                    // runCfg.qsim().setEndTime(8 * 3600);
+
                     Controler controler = new Controler(runCfg);
+                    // Bind probe (as ControlerListener + EventHandler)
+                    controler.addOverridingModule(new com.google.inject.AbstractModule() {
+                        @Override protected void configure() {
+                            addControlerListenerBinding().toInstance(probe);
+                            addEventHandlerBinding().toInstance(probe);
+                        }
+                    });
+
                     controler.run();
                     log.println("=== MATSim run completed ===");
                 } catch (Throwable t) {
@@ -113,100 +135,33 @@ public class OCPRewardServer {
                     }
                     exitCode = 1;
                 }
+
                 System.out.println("Process exited with code: " + exitCode);
 
-                // Compute rewards (robust to missing files)
-                double chargeReward = 0.0;
-                double timeReward = 0.0;
+                // >>> FIX: use probe-only rewards (no file parsing fallback — fastest path)
+                double timeReward = probe.getAvgLegDurationSec() / 86400.0;
+                double chargeReward = probe.getChargeIntegralProxy();
 
                 Path outDir = configPath.getParent().resolve("output");
-                Path chargeCsv = outDir.resolve("ITERS/it.0/0.average_charge_time_profiles.txt");
-                Path legDurTxt = outDir.resolve("ITERS/it.0/0.legdurations.txt");
-                Path evehiclesXMLPath = (vehiclesFileName == null || vehiclesFileName.isBlank())
-                        ? configPath.getParent().resolve("vehicles.xml")
-                        : configPath.getParent().resolve(vehiclesFileName);
 
-                // Charge reward
-                if (Files.exists(chargeCsv) && Files.isRegularFile(chargeCsv)) {
-                    double avgEnergyCapacity = getAverageEnergyCapacity(evehiclesXMLPath.toString());
-                    double avgChargeIntegral = 0.0;
-                    double totRecords = 0.0;
-
-                    try (Reader reader = new FileReader(chargeCsv.toString())) {
-                        Iterable<CSVRecord> records = CSVFormat.DEFAULT.withFirstRecordAsHeader().parse(reader);
-                        for (CSVRecord record : records) {
-                            String[] vals = record.values()[0].split("\t");
-                            if (vals.length >= 3) {
-                                double avgVal = Double.parseDouble(vals[2]);
-                                avgChargeIntegral += avgVal;
-                                totRecords += 1.0;
-                            }
-                        }
-                    } catch (Exception e) {
-                        try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
-                            log.println("Failed reading charge profiles: " + e.getMessage());
-                        }
-                    }
-
-                    double totEnergyCapacity = avgEnergyCapacity * totRecords;
-                    if (totEnergyCapacity > 0) chargeReward = avgChargeIntegral / totEnergyCapacity;
-                } else {
-                    try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
-                        log.println("Charge profiles file not found: " + chargeCsv);
-                    }
-                }
-
-                // Time reward
-                if (Files.exists(legDurTxt) && Files.isRegularFile(legDurTxt)) {
-                    try {
-                        String text = Files.readString(legDurTxt);
-                        Matcher m = Pattern.compile("average leg duration:\\s+([0-9.]+)\\s+seconds").matcher(text);
-                        if (m.find()) {
-                            double seconds = Double.parseDouble(m.group(1));
-                            timeReward = seconds / 86400.0; // normalize by seconds in a day
-                        }
-                    } catch (Exception e) {
-                        try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
-                            log.println("Failed reading leg durations: " + e.getMessage());
-                        }
-                    }
-                } else {
-                    try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
-                        log.println("Leg durations file not found: " + legDurTxt);
-                    }
-                }
-
+                // Build response (headers-only)
                 JSONObject response = new JSONObject();
                 response.put("filetype", initialResponse.get() ? "initialoutput" : "output");
                 response.put("charge_reward", Double.toString(chargeReward));
                 response.put("time_reward", Double.toString(timeReward));
                 initialResponse.set(false);
 
-                // Zip (create empty zip if output missing so the HTTP flow still completes)
-                File outputFolder = outDir.toFile();
-                File zipFile = configPath.getParent().resolve("output.zip").toFile();
-                if (!outputFolder.exists()) {
-                    outputFolder.mkdirs();
-                }
-                zipDirectory(outputFolder, zipFile);
-
-                // Send response
+                // >>> FIX: headers-only response, no body, no ZIP building/streaming here.
                 exchange.getResponseHeaders().set("X-Response-Message", response.toString());
-                exchange.sendResponseHeaders(200, zipFile.length());
+                exchange.sendResponseHeaders(200, -1); // no response body
+                exchange.close();
+                System.out.println("HTTP response sent (headers only).");
 
-                try (OutputStream os = exchange.getResponseBody();
-                     InputStream is = new FileInputStream(zipFile)) {
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = is.read(buffer)) != -1) {
-                        os.write(buffer, 0, bytesRead);
-                    }
-                }
-
-                // cleanup temp folder
+                // >>> FIX: cleanup using the correct symbol (outDir)
+                File outputFolder2 = outDir.toFile();
                 for (int i = 0; i < 5; i++) {
                     try {
-                        FileUtils.deleteDirectory(outputDir);
+                        FileUtils.deleteDirectory(outputFolder2);
                         break;
                     } catch (IOException e) {
                         try { Thread.sleep(200L); } catch (InterruptedException ignored) {}
@@ -221,33 +176,9 @@ public class OCPRewardServer {
         }
     }
 
-    private static void zipDirectory(File folder, File zipFile) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(zipFile);
-             ZipOutputStream zos = new ZipOutputStream(fos)) {
-            zipFileRecursive(folder, folder.getName(), zos);
-        }
-    }
-
-    private static void zipFileRecursive(File file, String entryName, ZipOutputStream zos) throws IOException {
-        if (file == null || !file.exists()) return;
-        if (file.isDirectory()) {
-            File[] list = file.listFiles();
-            if (list != null) {
-                for (File sub : list) {
-                    zipFileRecursive(sub, entryName + "/" + sub.getName(), zos);
-                }
-            }
-        } else {
-            zos.putNextEntry(new ZipEntry(entryName));
-            try (FileInputStream fis = new FileInputStream(file)) {
-                byte[] bytes = new byte[8192];
-                int length;
-                while ((length = fis.read(bytes)) >= 0) {
-                    zos.write(bytes, 0, length);
-                }
-            }
-            zos.closeEntry();
-        }
+    // --- kept for future use (energy capacity caching) ----------------------
+    private double getAverageEnergyCapacityCached(Path vehiclesPath) {
+        return capacityCache.computeIfAbsent(vehiclesPath, p -> getAverageEnergyCapacity(p.toString()));
     }
 
     public static double getAverageEnergyCapacity(String filePath) {

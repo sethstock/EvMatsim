@@ -2,168 +2,112 @@
 This script implements a reinforcement learning (RL) training pipeline using
 the Proximal Policy Optimization (PPO) algorithm from the Stable-Baselines3
 library. The training is performed on custom Matsim-based environments, which
-can either use a Multi-Layer Perceptron (MLP) or a Graph Neural Network (GNN)
-as the policy architecture.
+can use an MLP, a GNN, or a GraphGPS encoder as the policy backbone.
 
-The script supports parallelized environments, custom callbacks for
-TensorBoard logging and checkpointing, and configurable hyperparameters for
-training. It also allows resuming training from a previously saved model.
-
-Classes:
-    TensorboardCallback: A custom callback for logging additional metrics to
-    TensorBoard, such as average and best rewards.
-
-Functions:
-    main(args): The main function that sets up the environment, initializes
-    the PPO model, and starts the training process.
-
-Command-line Arguments:
-    matsim_config (str): Path to the MATSim configuration XML file.
-    --num_timesteps (int): Total number of timesteps to train. Default is
-    1,000,000.
-    --num_envs (int): Number of environments to run in parallel. Default is
-    100.
-    --num_agents (int): Number of vehicles to simulate in MATSim. Default is
-    -1 (use existing plans and vehicles).
-    --mlp_dims (str): Dimensions of the MLP layers, specified as
-    space-separated integers. Default is "256 128 64".
-    --results_dir (str): Directory to save TensorBoard logs and model
-    checkpoints. Default is "ppo_results".
-    --num_steps (int): Number of steps each environment takes before updating
-    the policy. Default is 1.
-    --batch_size (int): Number of samples PPO pulls from the replay buffer for
-    updates. Default is 25.
-    --learning_rate (float): Learning rate for the optimizer. Default is
-    0.00001.
-    --model_path (str): Path to a previously saved model to resume training.
-    Default is None.
-    --save_frequency (int): Frequency (in timesteps) to save model weights.
-    Default is 10,000.
-    --clip_range (float): Clip range for the PPO algorithm. Default is 0.2.
-    --policy_type (str): Type of policy to use ("MlpPolicy" or "GNNPolicy").
-    Default is "MlpPolicy".
-
-Usage:
-    Run the script from the command line, providing the required arguments.
-    For example:
-        python rl_algorithm_ppo.py /path/to/matsim_config.xml --num_timesteps
-        500000 --policy_type GNNPolicy
+It supports parallelized environments, custom callbacks for TensorBoard logging
+and checkpointing, and configurable hyperparameters. It also allows resuming
+training from a previously saved model.
 """
 
-import gymnasium as gym
 import argparse
 import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import (
-    BaseCallback,
-    CheckpointCallback,
-    CallbackList,
-)
-from datetime import datetime
-from pathlib import Path
-from rlev.envs.matsim_graph_env_gnn import MatsimGraphEnvGNN
-from rlev.envs.matsim_graph_env_mlp import MatsimGraphEnvMlp
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+# Optional imports only used for type hints/logging of best env
+from rlev.envs.matsim_graph_env_gnn import MatsimGraphEnvGNN  # noqa: F401
+from rlev.envs.matsim_graph_env_mlp import MatsimGraphEnvMlp  # noqa: F401
+
+# GraphGPS extractor (ensure this file exists: rlev/models/graphgps_extractor.py)
+from .graphgps_extractor import GraphGPSExtractor
+
+def _print_cuda_diag():
+    try:
+        import torch
+        info = dict(
+            cuda_available=torch.cuda.is_available(),
+            torch_cuda=torch.version.cuda,
+            n_devices=torch.cuda.device_count(),
+            current_device=(torch.cuda.current_device() if torch.cuda.is_available() else None),
+            device_name=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
+        )
+        print(f"[CUDA DIAG] {info}", flush=True)
+    except Exception as e:
+        print(f"[CUDA DIAG] error: {e}", flush=True)
 
 
 class TensorboardCallback(BaseCallback):
     """
-    A custom callback for reinforcement learning algorithms that integrates
-    with TensorBoard and tracks the performance of the environment.
-
-    Attributes:
-        save_dir (str or None): Directory path to save the best-performing
-        environment's data.
-        best_reward (float): The highest reward observed during training.
-        best_env (MatsimGraphEnvGNN | MatsimGraphEnvMlp): The environment
-        instance corresponding to the best reward.
-
-    Methods:
-        _on_step() -> bool:
-            Executes at each step of the training process. Calculates average
-            reward, updates the best reward and environment instance if a new
-            best reward is observed, and logs metrics to TensorBoard.
+    Logs average metrics and keeps track of the best-performing env snapshot.
+    Expects each env to put {"graph_env_inst": <env_instance>} into info dicts.
     """
 
-    def __init__(self, verbose=0, save_dir=None):
-        """
-        Initializes the TensorboardCallback.
-
-        Args:
-            verbose (int): Verbosity level.
-            save_dir (str or None): Directory to save the best-performing
-            environment's data.
-        """
-        super(TensorboardCallback, self).__init__(verbose)
+    def __init__(self, verbose: int = 0, save_dir: str | None = None):
+        super().__init__(verbose)
         self.save_dir = save_dir
         self.best_reward = -np.inf
-        self.best_env: MatsimGraphEnvGNN | MatsimGraphEnvMlp = None
+        # Keep the type annotation loose to support all env wrappers (MLP/GNN/GPS)
+        self.best_env: Any = None
 
     def _on_step(self) -> bool:
-        """
-        Executes at each step of the training process. Logs average and best
-        rewards to TensorBoard and saves the best-performing environment's
-        data.
+        avg_reward = 0.0
+        avg_cost = 0.0
+        avg_charger_eff = 0.0
+        avg_time_eff = 0.0
 
-        Returns:
-            bool: True to continue training.
-        """
-        avg_reward = 0
-        avg_cost = 0
-        avg_charger_efficiency = 0
-        avg_time_efficiency = 0
+        infos_list = self.locals.get("infos", [])
+        n = len(infos_list) if infos_list else 0
 
-        for i, infos in enumerate(self.locals["infos"]):
-            env_inst: MatsimGraphEnvGNN | MatsimGraphEnvMlp = infos["graph_env_inst"]
-            reward = env_inst._reward
+        for i, infos in enumerate(infos_list):
+            env_inst = infos.get("graph_env_inst", None)
+            if env_inst is None:
+                continue
+
+            reward = float(getattr(env_inst, "_reward", 0.0))
             avg_reward += reward
-            avg_cost += env_inst._charger_cost
-            avg_charger_efficiency += env_inst._charger_efficiency
-            avg_time_efficiency += env_inst._time_efficiency
+            avg_cost += float(getattr(env_inst, "_charger_cost", 0.0))
+            avg_charger_eff += float(getattr(env_inst, "_charger_efficiency", 0.0))
+            avg_time_eff += float(getattr(env_inst, "_time_efficiency", 0.0))
 
             if reward > self.best_reward:
+                self.best_reward = reward
                 self.best_env = env_inst
-                self.best_reward = self.best_env.best_reward
-                self.best_env.save_charger_config_to_csv(
-                    Path(self.save_dir, "best_chargers.csv")
-                )
-                self.best_env.save_server_output(
-                    self.best_env.best_output_response, "bestoutput"
-                )
+                # Persist best snapshot
+                if self.save_dir is not None:
+                    self.best_env.save_charger_config_to_csv(Path(self.save_dir, "best_chargers.csv"))
+                    if getattr(self.best_env, "best_output_response", None) is not None:
+                        self.best_env.save_server_output(self.best_env.best_output_response, "bestoutput")
 
-        self.logger.record("Avg Reward", (avg_reward / (i + 1)))
-        self.logger.record("Best Reward", self.best_reward)
-        self.logger.record("Avg Charger Cost", (avg_cost / (i + 1)))
-        self.logger.record("Avg Charger Efficiency", (avg_charger_efficiency / (i + 1)))
-        self.logger.record("Avg Time Efficiency", (avg_time_efficiency / (i + 1)))
+        if n > 0:
+            self.logger.record("metrics/avg_reward", avg_reward / n)
+            self.logger.record("metrics/best_reward", self.best_reward)
+            self.logger.record("metrics/avg_charger_cost", avg_cost / n)
+            self.logger.record("metrics/avg_charger_efficiency", avg_charger_eff / n)
+            self.logger.record("metrics/avg_time_efficiency", avg_time_eff / n)
 
         return True
 
 
 def main(args: argparse.Namespace):
-    """
-    Main function to set up the environment, initialize the PPO model, and
-    start the training process.
-
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
-    """
+    # Output directory for this run
     save_dir = f"{args.results_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}/"
-    os.makedirs(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
 
+    # Persist CLI args for reproducibility
     with open(Path(save_dir, "args.txt"), "w") as f:
-        for key, val in args.__dict__.items():
+        for key, val in vars(args).items():
             f.write(f"{key}:{val}\n")
 
+    # --------- Env factory ---------
     def make_env():
-        """
-        Creates a new environment instance based on the policy type.
-
-        Returns:
-            gym.Env: A new environment instance.
-        """
         if args.policy_type == "MlpPolicy":
             return gym.make(
                 "MatsimGraphEnvMlp-v0",
@@ -178,34 +122,76 @@ def main(args: argparse.Namespace):
                 num_agents=args.num_agents,
                 save_dir=save_dir,
             )
+        elif args.policy_type == "GraphGPS":
+            # Requires your GraphGPS env wrapper to be registered as MatsimGraphEnvGPS-v0
+            return gym.make(
+                "MatsimGraphEnvGPS-v0",
+                config_path=args.matsim_config,
+                num_agents=args.num_agents,
+                save_dir=save_dir,
+                pe_dim=0,  # set >0 once you add positional encodings
+            )
+        else:
+            raise ValueError(f"Unknown policy_type: {args.policy_type}")
 
-    env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
-    """
-    n_steps: Number of steps for each environment to collect data before a 
-    batch is processed.
-    batch_size: Amount of data sampled every n_steps from the replay buffer. 
-    Total samples = num_envs * iterations.
+    # Windows-friendly vectorized env (threads, not processes)
+    env = DummyVecEnv([make_env for _ in range(args.num_envs)])
 
-    The save frequency only accounts for the number of times each env has run, 
-    so we divide it to save every args.save_frequency timesteps.
-    """
-    args.save_frequency //= args.num_envs
+    # The save frequency only accounts for how many times each env has run,
+    # so divide to save every args.save_frequency *total* timesteps.
+    args.save_frequency //= max(1, args.num_envs)
 
-    tensorboard_callback = TensorboardCallback(save_dir=save_dir)
-    checkpoint_callback = CheckpointCallback(
-        save_freq=args.save_frequency, save_path=save_dir
-    )
-    callback = CallbackList([tensorboard_callback, checkpoint_callback])
+    tensorboard_cb = TensorboardCallback(save_dir=save_dir)
+    checkpoint_cb = CheckpointCallback(save_freq=args.save_frequency, save_path=save_dir)
+    callback = CallbackList([tensorboard_cb, checkpoint_cb])
 
-    policy_kwargs = dict(net_arch=args.mlp_dims)
+    # --------- Policy selection + kwargs ---------
+    _print_cuda_diag()
 
+    if args.device == "cuda":
+        device_str = "cuda:0"  # will raise if CUDA is actually unavailable
+    elif args.device == "cpu":
+        device_str = "cpu"
+    else:
+    # auto
+        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    print(f"[RL] Using device={device_str}", flush=True)
+
+
+    # Default: MLP / legacy GNN path
+    policy_id = args.policy_type
+    policy_kwargs: dict[str, Any] = dict(net_arch=args.mlp_dims)
+
+    # GraphGPS path uses a custom features extractor and MultiInputPolicy
+    if args.policy_type == "GraphGPS":
+        policy_id = "MultiInputPolicy"
+        policy_kwargs = dict(
+            features_extractor_class=GraphGPSExtractor,
+            features_extractor_kwargs=dict(
+                features_dim=128,
+                num_layers=3,
+                heads=4,
+                dropout=0.2,
+                attn_dropout=0.2,
+                fixed_k=128,     # lower to 48/32 if still tight on VRAM
+                use_amp=True,
+                use_cudagraphs=True,
+            ),
+            net_arch=dict(pi=[128], vf=[128]),
+            share_features_extractor=True,
+        )
+
+
+
+    # --------- Build or load model ---------
     if args.model_path:
         model = PPO.load(
             args.model_path,
-            env,
+            env=env,
             n_steps=args.num_steps,
             verbose=1,
-            device="cuda:0" if torch.cuda.is_available() else "cpu",
+            device=device_str,
             tensorboard_log=save_dir,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
@@ -213,11 +199,11 @@ def main(args: argparse.Namespace):
         )
     else:
         model = PPO(
-            args.policy_type,
+            policy_id,
             env,
             n_steps=args.num_steps,
             verbose=1,
-            device="cuda:0" if torch.cuda.is_available() else "cpu",
+            device=device_str,
             tensorboard_log=save_dir,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
@@ -225,6 +211,14 @@ def main(args: argparse.Namespace):
             policy_kwargs=policy_kwargs,
         )
 
+    # Optional: enable CUDA Graphs capture for GraphGPS after warmup (fixed shapes required)
+    if args.policy_type == "GraphGPS" and torch.cuda.is_available():
+        try:
+            model.policy.features_extractor._use_cudagraphs = True  # capture on first forward
+        except Exception:
+            pass
+
+    # --------- Train ---------
     # total_timesteps = n_steps * num_envs * iterations
     model.learn(total_timesteps=args.num_timesteps, callback=callback)
     model.save(Path(save_dir, "ppo_matsim"))
@@ -235,91 +229,54 @@ if __name__ == "__main__":
         description="Train a PPO model on the MatsimGraphEnv.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "matsim_config", type=str, help="Path to the matsim config.xml file."
-    )
+    parser.add_argument("matsim_config", type=str, help="Path to the matsim config.xml file.")
     parser.add_argument(
         "--num_timesteps",
         type=int,
         default=1_000_000,
-        help="Total number of timesteps to train. \
-                        num_timesteps = n_steps * num_envs * iterations.",
+        help="Total number of timesteps to train. num_timesteps = n_steps * num_envs * iterations.",
     )
-    parser.add_argument(
-        "--num_envs",
-        type=int,
-        default=100,
-        help="Number of environments to run in parallel.",
-    )
+    parser.add_argument("--num_envs", type=int, default=100, help="Number of environments to run in parallel.")
     parser.add_argument(
         "--num_agents",
         type=int,
         default=-1,
-        help="Number of vehicles to simulate in the matsim simulator. If \
-                        num_agents < 0, the current plans.xml and vehicles.xml \
-                        files will be used and not updated.",
+        help=(
+            "Number of vehicles to simulate in the matsim simulator. "
+            "If num_agents < 0, existing plans.xml and vehicles.xml are used."
+        ),
     )
     parser.add_argument(
         "--mlp_dims",
         default="256 128 64",
-        help="Dimensions of the multi-layer perceptron given as space-separated \
-                        integers. Can be any number of layers. Default has 3 \
-                        layers.",
+        help="Dimensions of the MLP layers as space-separated integers (e.g., '256 128 64').",
     )
-    parser.add_argument(
-        "--results_dir",
-        type=str,
-        default=Path(Path(__file__).parent, "ppo_results"),
-        help="Directory to save TensorBoard logs and model checkpoints.",
-    )
-    parser.add_argument(
-        "--num_steps",
-        type=int,
-        default=1,
-        help="Number of steps each environment takes before the policy and \
-                        value function are updated.",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=25,
-        help="Number of samples PPO should pull from the replay buffer when \
-                        updating the policy and value function.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=0.00001,
-        help="Learning rate for the optimizer. If the actor outputs NaNs from \
-                        the MLP network, reduce this value.",
-    )
-    parser.add_argument(
-        "--model_path",
-        default=None,
-        help="Path to the saved model.zip file if you wish to resume training.",
-    )
-    parser.add_argument(
-        "--save_frequency",
-        type=int,
-        default=10000,
-        help="How often to save the model weights in total timesteps.",
-    )
-    parser.add_argument(
-        "--clip_range",
-        default=0.2,
-        type=float,
-        help="Clip range for the PPO algorithm.",
-    )
+    parser.add_argument("--results_dir", type=str, default=Path(Path(__file__).parent, "ppo_results"),
+                        help="Directory to save TensorBoard logs and model checkpoints.")
+    parser.add_argument("--num_steps", type=int, default=1,
+                        help="Number of steps each environment takes before updating the policy/value.")
+    parser.add_argument("--batch_size", type=int, default=25,
+                        help="Batch size PPO uses when sampling from the rollout buffer for updates.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5,
+                        help="Optimizer learning rate.")
+    parser.add_argument("--model_path", default=None,
+                        help="Path to a saved model.zip to resume training.")
+    parser.add_argument("--save_frequency", type=int, default=10_000,
+                        help="How often to save model weights, in *total* timesteps.")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range.")
     parser.add_argument(
         "--policy_type",
         default="MlpPolicy",
-        choices=["MlpPolicy", "GNNPolicy"],
+        choices=["MlpPolicy", "GNNPolicy", "GraphGPS"],
         type=str,
-        help="The policy type to use for the PPO algorithm.",
+        help="Policy type / encoder backbone.",
     )
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
+                    help="Device override. 'auto' chooses cuda if available else cpu.")
 
-    parser.print_help()
+    # Parse + normalize args
     args = parser.parse_args()
-    args.mlp_dims = [int(x) for x in args.mlp_dims.split(" ")]
-
+    # Convert "256 128 64" -> [256, 128, 64]
+    args.mlp_dims = [int(x) for x in str(args.mlp_dims).split()]
+    # Run
     main(args)

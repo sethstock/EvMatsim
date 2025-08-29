@@ -9,3 +9,8 @@ register(
     id="MatsimGraphEnvMlp-v0", 
     entry_point="rlev.envs.matsim_graph_env_mlp:MatsimGraphEnvMlp",
 )
+
+register(
+    id="MatsimGraphEnvGPS-v0",
+    entry_point="rlev.envs.matsim_graph_env_gps:MatsimGraphEnvGPS",
+)

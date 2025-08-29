@@ -134,6 +134,11 @@ class MatsimGraphEnv(gym.Env):
         }
         response = requests.post(url, params={"folder_name": self.time_string}, files=files)
         json_response = json.loads(response.headers["X-response-message"])
+
+        filetype = json_response.get("filetype", "none")
+        if filetype == "initialoutput" and response.headers.get("Content-Length", "0") != "0":
+            self.save_server_output(response, filetype)  # only if server actually sent bytes
+
         charge_reward = float(json_response["charge_reward"])
         time_reward = float(json_response["time_reward"])
 
